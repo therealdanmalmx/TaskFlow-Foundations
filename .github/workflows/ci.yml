@@ -1,0 +1,52 @@
+name: pull-request-checks
+
+on:
+  pull_request:
+
+concurrency:
+  group: pull-request-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      DB_PASSWORD: pull-request-validation-only
+      IMAGE_REPOSITORY: ghcr.io/example/taskflow
+      IMAGE_TAG: latest
+      # Dummy values so the prod Compose render passes its :? guards; nothing
+      # here runs against a real environment.
+      JWT_SECRET: pull-request-validation-only-jwt-secret-012345
+      ADMIN_PASSWORD: pull-request-validation-only
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Test the API against disposable Postgres
+        run: dotnet test TaskFlow.slnx -c Release
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: src/TaskFlow.Web/package-lock.json
+
+      - name: Lint, test, and build the frontend
+        working-directory: src/TaskFlow.Web
+        run: npm ci && npm run lint && npm test && npm run build
+
+      # Render the development and production Compose contracts. A broken
+      # stack should fail here, not on the server.
+      - name: Render the Compose contracts
+        run: |
+          docker compose -f docker-compose.dev.yml config --quiet
+          docker compose -f docker-compose.prod.yml config --quiet

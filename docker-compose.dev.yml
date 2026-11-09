@@ -1,0 +1,82 @@
+# Local development stack: builds the image from this repo and runs it with
+# Postgres. One command from a clean clone:
+#
+#   docker compose -f docker-compose.dev.yml up --build
+#
+# Then open http://localhost:8080. Credentials here are throwaway dev values —
+# production secrets live on the server, never in the repo (see docker-compose.prod.yml).
+#
+# Ports 8080, 5432 or 6379 already taken on your machine? Override the host side:
+#
+#   APP_PORT=8081 DB_PORT=15432 REDIS_PORT=16379 docker compose -f docker-compose.dev.yml up --build
+
+services:
+  app:
+    build: .
+    ports:
+      # Bind only to this machine; don't expose the fixture on café/LAN Wi-Fi.
+      - "127.0.0.1:${APP_PORT:-8080}:8080"
+    logging:
+      driver: local
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__Db: Host=postgres;Port=5432;Database=taskflow;Username=taskflow;Password=taskflow
+      ConnectionStrings__Redis: redis:6379
+      RUN_MIGRATIONS: "true"
+      # Throwaway dev auth seed values (matching appsettings.Development.json):
+      # log in as the seeded owner with admin / taskflow-dev-password.
+      Auth__JwtSecret: dev-only-jwt-secret-never-use-in-production-0123456789
+      Auth__AdminUsername: admin
+      Auth__AdminPassword: taskflow-dev-password
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # service_started, not service_healthy — deliberately. The app must come
+      # up even when the cache is down; Redis is an optional dependency.
+      redis:
+        condition: service_started
+    healthcheck:
+      # /health/ready checks the database connection, not just the process.
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:8-alpine
+    # A cache, configured like one: no persistence (losing it must be fine),
+    # a memory ceiling, and least-recently-used eviction once it is full.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+    logging:
+      driver: local
+    ports:
+      # Exposed on loopback so you can poke at keys with redis-cli while developing.
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:18
+    logging:
+      driver: local
+    environment:
+      POSTGRES_USER: taskflow
+      POSTGRES_PASSWORD: taskflow
+      POSTGRES_DB: taskflow
+    ports:
+      # Exposed so you can poke at the database with psql/a GUI while developing.
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
+    volumes:
+      # postgres:18 images keep data under /var/lib/postgresql (not .../data).
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskflow -d taskflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres-data:

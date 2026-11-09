@@ -1,0 +1,9 @@
+# Keep the build context small: only source files reach the Docker daemon.
+.git
+**/bin
+**/obj
+**/node_modules
+**/dist
+**/.env*
+README.md
+ops

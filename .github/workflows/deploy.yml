@@ -1,0 +1,203 @@
+# Production pipeline: test -> build once -> smoke-test that exact image ->
+# publish it -> reach private Dokploy over Tailscale -> request a deployment.
+#
+# Repository secrets (Module 7):
+#   TS_OAUTH_CLIENT_ID, TS_OAUTH_SECRET, DOKPLOY_API_KEY
+# Repository variables:
+#   DEPLOY_ENABLED=true, DOKPLOY_HOST=<tailnet IP or MagicDNS name>,
+#   DOKPLOY_COMPOSE_ID=<id copied from Dokploy>, APP_URL=https://app.example.com
+# Variables are readable, non-secret controls/identifiers; authentication
+# credentials stay in secrets.
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Finish an accepted deployment before another release starts. Cancelling a
+# runner cannot cancel work already accepted by Dokploy.
+# Newer runs can replace pending runs, but never interrupt the active run.
+concurrency:
+  group: taskflow-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # Docker image names must be lowercase; GitHub usernames are not always.
+      - name: Set the image name (lowercase)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Run the API tests
+        run: dotnet test TaskFlow.slnx -c Release
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: src/TaskFlow.Web/package-lock.json
+
+      - name: Lint and test the frontend
+        working-directory: src/TaskFlow.Web
+        run: npm ci && npm run lint && npm test
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A full-SHA tag is written only once by this workflow. A rerun reuses
+      # that exact registry artifact instead of rebuilding and overwriting it.
+      - name: Check for an existing commit artifact
+        id: artifact
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if LOOKUP="$(docker manifest inspect "$IMAGE:${GITHUB_SHA}" 2>&1)"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif grep -Eqi 'manifest unknown|no such manifest' <<<"$LOOKUP"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            printf '%s\n' "$LOOKUP" >&2
+            echo "Registry lookup failed; refusing a build that might overwrite the commit tag." >&2
+            exit 1
+          fi
+
+      - name: Build image once
+        if: ${{ steps.artifact.outputs.exists != 'true' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          build-args: GIT_SHA=${{ github.sha }}
+          provenance: false
+
+      - name: Pull an already-published commit artifact
+        if: ${{ steps.artifact.outputs.exists == 'true' }}
+        run: docker pull "$IMAGE:${GITHUB_SHA}"
+
+      - name: Smoke-test the exact image
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          trap 'docker rm -f smoke >/dev/null 2>&1 || true' EXIT
+          # The JWT secret is startup-validated (fail loud), so the smoke run
+          # needs one; any 32+ character value works because no login happens
+          # here. No admin password: seeding is skipped with migrations off.
+          docker run -d --name smoke -p 127.0.0.1:8080:8080 \
+            -e RUN_MIGRATIONS=false \
+            -e Auth__JwtSecret=smoke-test-only-secret-0123456789abcdef \
+            "$IMAGE:${GITHUB_SHA}"
+          for _ in $(seq 1 15); do
+            if curl --connect-timeout 2 --max-time 5 -fsS http://localhost:8080/health/live >/dev/null \
+              && curl --connect-timeout 2 --max-time 5 -fsS http://localhost:8080/ | grep -q '<div id="root">' \
+              && [ "$(curl --connect-timeout 2 --max-time 5 -fsS http://localhost:8080/version.json | jq -r .sha)" = "$GITHUB_SHA" ]; then
+              echo "Smoke test passed"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Smoke test failed: app never became live"
+          docker logs smoke
+          exit 1
+
+      # Push the already-tested local image. There is deliberately no second
+      # build here: a rebuild could produce a different artifact. Publish the
+      # non-overwritten commit receipt first so latest never advances without
+      # its rollback artifact. A rerun of the current head reuses that artifact.
+      # An old run must not silently roll back latest. Roll back with IMAGE_TAG.
+      - name: Push tested image to GHCR
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          BRANCH_SHA="$(git ls-remote --exit-code origin refs/heads/main | cut -f1)"
+          if [ "$BRANCH_SHA" != "$GITHUB_SHA" ]; then
+            echo "This commit is no longer main. Run the latest workflow instead."
+            exit 1
+          fi
+          if [ "${{ steps.artifact.outputs.exists }}" != "true" ]; then
+            docker push "$IMAGE:${GITHUB_SHA}"
+          fi
+          docker tag "$IMAGE:${GITHUB_SHA}" "$IMAGE:latest"
+          docker push "$IMAGE:latest"
+          DIGEST="$(docker buildx imagetools inspect "$IMAGE:${GITHUB_SHA}" | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)"
+          test -n "$DIGEST"
+          printf '### Published artifact\n\n`%s@%s`\n' "$IMAGE" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+      # The GitHub-hosted runner becomes a short-lived tag:ci device. Dokploy
+      # stays private; the runner is removed from the tailnet after the job.
+      - name: Join the private tailnet
+        if: ${{ vars.DEPLOY_ENABLED == 'true' }}
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          ping: ${{ vars.DOKPLOY_HOST }}
+
+      - name: Ask Dokploy to deploy
+        if: ${{ vars.DEPLOY_ENABLED == 'true' }}
+        env:
+          DOKPLOY_HOST: ${{ vars.DOKPLOY_HOST }}
+          DOKPLOY_COMPOSE_ID: ${{ vars.DOKPLOY_COMPOSE_ID }}
+          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          : "${DOKPLOY_HOST:?Set the DOKPLOY_HOST repository variable}"
+          : "${DOKPLOY_COMPOSE_ID:?Set the DOKPLOY_COMPOSE_ID repository variable}"
+          : "${DOKPLOY_API_KEY:?Set the DOKPLOY_API_KEY repository secret}"
+          curl --fail-with-body --silent --show-error \
+            --connect-timeout 5 --max-time 30 \
+            -X POST "http://${DOKPLOY_HOST}:3000/api/compose.deploy" \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: ${DOKPLOY_API_KEY}" \
+            --data "{\"composeId\":\"${DOKPLOY_COMPOSE_ID}\",\"title\":\"CI ${GITHUB_SHA::7}\"}"
+
+      # API acceptance is not deployment success. Wait until the public app is
+      # ready and serves the full SHA receipt baked into this exact image.
+      - name: Verify the deployed SHA
+        if: ${{ vars.DEPLOY_ENABLED == 'true' }}
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          : "${APP_URL:?Set the APP_URL repository variable}"
+          APP_URL="${APP_URL%/}"
+          DEADLINE=$((SECONDS + 300))
+          while (( SECONDS < DEADLINE )); do
+            LIVE_SHA="$(curl --connect-timeout 3 --max-time 5 -fsS "$APP_URL/version.json" | jq -r '.sha // empty' || true)"
+            if [ "$LIVE_SHA" = "$GITHUB_SHA" ] \
+              && curl --connect-timeout 3 --max-time 5 -fsS "$APP_URL/health/ready" >/dev/null; then
+              echo "Deployment verified at ${GITHUB_SHA}"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Dokploy accepted the request, but the expected SHA never became ready."
+          exit 1

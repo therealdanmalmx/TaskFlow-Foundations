@@ -1,0 +1,114 @@
+# Production stack — this is the file Dokploy consumes (Compose service type).
+#
+# Differences from docker-compose.dev.yml, and why:
+#   - `image:` instead of `build:` — the server never builds; it pulls the image
+#     that CI already built, tested, and pushed to GHCR.
+#   - Secrets come from environment variables with NO defaults. Set them in the
+#     Dokploy UI (Environment tab). `${DB_PASSWORD:?...}` makes the stack refuse
+#     to start if a secret is missing — fail loud, not with a broken app.
+#   - `restart: unless-stopped` — containers come back after process exit or reboot.
+#     Healthchecks report status; they do not restart an unhealthy process.
+#   - Per-service `local` logging rotates automatically without replacing the
+#     host's Docker daemon configuration.
+#   - No published ports on the app: Traefik (managed by Dokploy) reaches it over
+#     the internal Docker network and terminates TLS at the edge.
+
+services:
+  app:
+    # Copy the exact lowercase repository printed by CI. IMAGE_TAG defaults to
+    # the production channel; set it to a full commit SHA for an exact rollback.
+    image: ${IMAGE_REPOSITORY:?IMAGE_REPOSITORY is not set}:${IMAGE_TAG:-latest}
+    pull_policy: always
+    restart: unless-stopped
+    logging:
+      driver: local
+    environment:
+      ConnectionStrings__Db: Host=postgres;Port=5432;Database=taskflow;Username=taskflow;Password=${DB_PASSWORD:?DB_PASSWORD is not set}
+      # No secret here: Redis is reachable only on this stack's internal
+      # network, holds no durable data, and the app treats it as optional.
+      ConnectionStrings__Redis: redis:6379
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
+      ASPNETCORE_URLS: http://+:8080
+      # JWT signing secret plus the first-boot course-owner credentials. Same rules
+      # as DB_PASSWORD: no defaults, set them in the Dokploy UI, and the stack
+      # refuses to start if one is missing. The seeded owner is created once on
+      # an empty database; registered users then receive isolated workspaces.
+      # Changing ADMIN_PASSWORD later does NOT update the stored password.
+      Auth__JwtSecret: ${JWT_SECRET:?JWT_SECRET is not set}
+      Auth__AdminUsername: ${ADMIN_USERNAME:-admin}
+      Auth__AdminPassword: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is not set}
+    expose:
+      # Internal only — Traefik routes traffic to this port; nothing is
+      # published on the host.
+      - "8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # service_started, not service_healthy — the app must start even when
+      # the cache is down. Losing Redis degrades the app; it never blocks it.
+      redis:
+        condition: service_started
+    healthcheck:
+      # /health/ready verifies the database connection. This reports whether
+      # the app can serve traffic; it does not trigger a Docker restart.
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    # Traefik routing labels: Dokploy sets these for you when you add a domain
+    # in the UI (shown in Module 6.4), so they stay commented out here. Keeping
+    # them in the file instead also works — uncomment and adjust if you prefer
+    # config-as-code over panel-configured domains:
+    #
+    # labels:
+    #   - traefik.enable=true
+    #   - traefik.http.routers.taskflow.rule=Host(`app.example.com`)
+    #   - traefik.http.routers.taskflow.entrypoints=websecure
+    #   - traefik.http.routers.taskflow.tls.certresolver=letsencrypt
+    #   - traefik.http.services.taskflow.loadbalancer.server.port=8080
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    # A cache, configured like one: persistence off (its contents are
+    # disposable by design), a memory ceiling, and LRU eviction when full.
+    # There is deliberately no volume and no entry in the backup module:
+    # if data would hurt to lose, it does not belong in Redis.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+    logging:
+      driver: local
+    # No ports: the cache is reachable only from containers on this network,
+    # never from the internet.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:18
+    restart: unless-stopped
+    logging:
+      driver: local
+    environment:
+      # Course simplification: the initialization owner also runs migrations and
+      # the disposable app. Real apps should separate admin/migration/runtime roles.
+      POSTGRES_USER: taskflow
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is not set}
+      POSTGRES_DB: taskflow
+    # No ports: the database is reachable only from containers on this network,
+    # never from the internet.
+    volumes:
+      # Named volume = the data survives redeploys and container replacement.
+      # This volume is what the backup module (ops/backup-restore.md) protects.
+      # postgres:18 images keep data under /var/lib/postgresql (not .../data).
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskflow -d taskflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres-data:

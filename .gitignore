@@ -1,0 +1,22 @@
+# .NET
+bin/
+obj/
+*.user
+
+# Node
+node_modules/
+dist/
+
+# Local env files (never commit real secrets)
+.env
+.env.*
+!.env.example
+
+# Learner-specific context and operational receipts stay on the learner's machine
+ops/agent-context.local.md
+ops/receipts.local/
+
+# IDE
+.vs/
+.idea/
+.DS_Store
